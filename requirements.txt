@@ -1,2 +1,8 @@
 fastapi
 uvicorn[standard]
+sqlalchemy
+anthropic
+openai
+python-dotenv
+requests
+websockets

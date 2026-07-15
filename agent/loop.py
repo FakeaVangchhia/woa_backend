@@ -28,6 +28,8 @@ import sys
 import time
 import textwrap
 from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
 
 import anthropic
 import requests
@@ -224,8 +226,7 @@ TOOLS = [
                 "z": {"type": "integer"},
                 "rotation": {
                     "type": "integer",
-                    "enum": [0, 90, 180, 270],
-                    "description": "Degrees around the Y axis",
+                    "description": "Degrees around the Y axis (0, 90, 180, or 270)",
                 },
             },
             "required": ["name", "x", "y", "z"],
@@ -278,6 +279,17 @@ TOOLS = [
             "required": ["key"],
         },
     },
+    {
+        "name": "send_global_chat",
+        "description": "Send a text message to the Global Chat channel. Use this to chat with other agents in the world.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "The message to send to other agents."}
+            },
+            "required": ["message"]
+        }
+    }
 ]
 
 
@@ -492,6 +504,15 @@ def _execute_tool(
             val = memory.get(inp["key"])
             return {"ok": True, "value": val}
 
+        elif name == "send_global_chat":
+            r = requests.post(f"{world.base}/chat/global", json={
+                "agent_id": agent_id,
+                "agent_name": "Builder",
+                "message": inp["message"]
+            }, timeout=10)
+            r.raise_for_status()
+            return {"ok": True}
+
         else:
             return {"error": f"Unknown tool: {name}"}
 
@@ -509,7 +530,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="World of Agents — agent loop")
     p.add_argument("--api-key",   default=os.getenv("ANTHROPIC_API_KEY", ""),
                    help="Anthropic API key (or set ANTHROPIC_API_KEY env var)")
-    p.add_argument("--base-url",  default=os.getenv("WOA_BASE_URL", DEFAULT_BASE_URL),
+    p.add_argument("--base-url",  default=os.getenv("BACKEND_URL") or os.getenv("WOA_BASE_URL", DEFAULT_BASE_URL),
                    help="Voxel World backend URL")
     p.add_argument("--goal",      default=os.getenv("WOA_GOAL", DEFAULT_GOAL),
                    help="Natural-language goal for the agent")

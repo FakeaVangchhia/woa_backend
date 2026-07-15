@@ -1,84 +1,217 @@
-"""
-Voxel World backend (v1 prototype)
-
-In-memory voxel world. Exposes a small REST API that both a human (via the
-Three.js frontend) and, later, an LLM agent (via tool calls) can use to read
-and modify the world. The voxel grid is the shared "ground truth" — the
-frontend is just a renderer of whatever this API says exists.
-"""
-
 import json
+import time
+import os
+import asyncio
+import textwrap
 import urllib.error
 import urllib.request
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import time
+from dotenv import load_dotenv
 
-app = FastAPI(title="Voxel World API", version="0.1.0")
+# Load env file
+load_dotenv()
 
-# Wide-open CORS for local prototyping. Tighten this before any real deployment.
+from app.database import (
+    SessionLocal,
+    BlockModel,
+    AgentModel,
+    AgentMemoryModel,
+    init_db,
+    seed_if_empty
+)
+
+# Global variables
+main_loop = None
+WORLD_STARTED_AT = time.time()
+
+GLOBAL_CHATS = [
+    {
+        "id": 1,
+        "agent_id": "sim-bob",
+        "agent_name": "BuilderBob",
+        "message": "Hello world! Just logged into the voxel world.",
+        "timestamp": time.time() - 300
+    },
+    {
+        "id": 2,
+        "agent_id": "sim-alice",
+        "agent_name": "AliceVoxel",
+        "message": "Hey BuilderBob! I'm planning to build a garden at x=5, z=5.",
+        "timestamp": time.time() - 250
+    }
+]
+background_tasks = set()
+
+async def simulate_global_chat_loop():
+    import random
+    simulated_agents = [
+        {"id": "sim-bob", "name": "BuilderBob"},
+        {"id": "sim-alice", "name": "AliceVoxel"},
+        {"id": "sim-master", "name": "VoxelMaster"},
+        {"id": "sim-lego", "name": "LegoLover"},
+        {"id": "sim-block", "name": "Blocky"}
+    ]
+    chat_pool = [
+        "Just placed a block of glass at the top of my tower. The view is amazing!",
+        "Has anyone tried building a castle at coordinates (20, 1, -15)?",
+        "I need more wood blocks. Running low.",
+        "Who is placing water blocks everywhere? It's flooding!",
+        "My house is finally complete. 5x5 brick wall with a stone roof.",
+        "I'm exploring the north side of the map.",
+        "Ollama is running a bit slow today, but my builder is doing great!",
+        "Is anyone online? I want to show my brick path.",
+        "Just spawned a huge forest near spawn. Green everywhere!",
+        "Making a glass dome. It takes so many ticks!",
+        "Trying to build a bridge across the water stream.",
+        "Hey! Let's collaborate on a castle.",
+        "I'm setting my memory to remember my home coordinates.",
+        "My goal today is to build a massive pyramid.",
+        "Just finished clearing some dirt blocks."
+    ]
+    while True:
+        try:
+            await asyncio.sleep(random.randint(20, 40))
+            agent = random.choice(simulated_agents)
+            message = random.choice(chat_pool)
+            new_msg = {
+                "id": len(GLOBAL_CHATS) + 1,
+                "agent_id": agent["id"],
+                "agent_name": agent["name"],
+                "message": message,
+                "timestamp": time.time()
+            }
+            GLOBAL_CHATS.append(new_msg)
+            broadcast_sync({
+                "event": "global_chat",
+                "message": new_msg
+            })
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print("Error in simulate_global_chat_loop:", e)
+            await asyncio.sleep(5)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    init_db()
+    seed_if_empty()
+    
+    # Simulated chat background task is frozen/disabled to focus on a single agent.
+    # task = asyncio.create_task(simulate_global_chat_loop())
+    # background_tasks.add(task)
+    # task.add_done_callback(background_tasks.discard)
+    
+    yield
+
+app = FastAPI(title="Voxel World API", version="0.1.0", lifespan=lifespan)
+
+# CORS setup
+ENV = os.getenv("ENV", "development")
+ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
+
+if ENV == "production":
+    if ALLOWED_ORIGINS_ENV:
+        origins = [o.strip() for o in ALLOWED_ORIGINS_ENV.split(",") if o.strip()]
+    else:
+        origins = []
+else:
+    origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
-# World state
+# WebSocket Connection Manager
 # ---------------------------------------------------------------------------
-# Sparse voxel grid: keys are "x,y,z" integer-coordinate strings, values are
-# block type strings. Sparse + dict-based is fine for a prototype; swap for
-# a chunked store (e.g. one dict per 16x16x16 region) once the world gets big.
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
 
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                if connection in self.active_connections:
+                    self.active_connections.remove(connection)
+
+manager = ConnectionManager()
+
+def broadcast_sync(message: dict):
+    if main_loop is not None:
+        asyncio.run_coroutine_threadsafe(manager.broadcast(message), main_loop)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Receive data to keep connection alive
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
+# ---------------------------------------------------------------------------
+# World State Configuration
+# ---------------------------------------------------------------------------
 BLOCK_TYPES = {"grass", "dirt", "stone", "wood", "leaves", "water", "sand", "glass", "brick"}
-
-world: dict[str, str] = {}
-
-agents: dict[str, dict] = {}  # agent_id -> {x, y, z, name, color}
-agent_run_state: dict[str, dict] = {}
-
-WORLD_STARTED_AT = time.time()
 DEFAULT_AGENT_ID = "web-builder"
 DEFAULT_AGENT_NAME = "Builder"
 DEFAULT_AGENT_COLOR = "#f5d000"
 MAX_TOOL_CALLS_PER_TICK = 8
 
+# Helper for memory storage
+def get_agent_memory_dict(db, agent_id: str) -> dict[str, str]:
+    rows = db.query(AgentMemoryModel).filter_by(agent_id=agent_id).all()
+    return {row.key: row.value for row in rows}
 
-def _key(x: int, y: int, z: int) -> str:
-    return f"{x},{y},{z}"
+def set_agent_memory(db, agent_id: str, key: str, value: str):
+    row = db.query(AgentMemoryModel).filter_by(agent_id=agent_id, key=key).first()
+    if row:
+        row.value = value
+    else:
+        row = AgentMemoryModel(agent_id=agent_id, key=key, value=value)
+        db.add(row)
+    db.commit()
 
-
-def _seed_world():
-    """Lay down a simple flat grass island so there's something to stand on."""
-    size = 24
-    for x in range(-size, size + 1):
-        for z in range(-size, size + 1):
-            world[_key(x, 0, z)] = "grass"
-            world[_key(x, -1, z)] = "dirt"
-
-
-_seed_world()
-
+def get_agent_memory(db, agent_id: str, key: str) -> str | None:
+    row = db.query(AgentMemoryModel).filter_by(agent_id=agent_id, key=key).first()
+    return row.value if row else None
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
-
 class Block(BaseModel):
     x: int
     y: int
     z: int
     type: str = Field(..., description="Block type, e.g. 'grass', 'stone', 'wood'")
 
-
 class BlockDelete(BaseModel):
     x: int
     y: int
     z: int
-
 
 class StructureSpawn(BaseModel):
     name: str  # "small_house" | "tree" | "wall"
@@ -86,7 +219,6 @@ class StructureSpawn(BaseModel):
     y: int
     z: int
     rotation: int = 0  # 0/90/180/270 degrees, applied around y-axis
-
 
 class AgentRegister(BaseModel):
     agent_id: str
@@ -96,20 +228,18 @@ class AgentRegister(BaseModel):
     z: int = 0
     color: str = "#f5d000"
 
-
 class AgentMove(BaseModel):
     x: int
     y: int
     z: int
 
-
+# Old agent run models for compatibility
 class AgentRunRequest(BaseModel):
     provider: str = Field(..., description="groq, openai, gemini, or openai-compatible")
     model: str | None = None
     api_key: str
     goal: str
     base_url: str | None = None
-
 
 class AgentRunResponse(BaseModel):
     ok: bool
@@ -119,58 +249,89 @@ class AgentRunResponse(BaseModel):
     actions: list[dict]
     block_count: int
 
+# New agent run models (Task 3)
+class AgentRunRequestBody(BaseModel):
+    provider: str = Field(..., description="gemini, openai, anthropic, groq, or ollama")
+    model: str = Field(..., description="Model identifier")
+    api_key: str = Field(..., description="API Key for the provider")
+    goal: str = Field(..., description="Agent goal")
+    ticks: int = Field(1, ge=1, le=3, description="Number of ticks to run (1-3)")
+
+class TickSummary(BaseModel):
+    tick: int
+    thought: str
+    actions: list[dict]
+
+class AgentRunSummaryResponse(BaseModel):
+    ok: bool
+    agent_id: str
+    ticks_run: int
+    agent: dict
+    ticks_detail: list[TickSummary]
 
 # ---------------------------------------------------------------------------
 # World read/write endpoints
 # ---------------------------------------------------------------------------
-
 @app.get("/world")
 def get_world():
     """Full world snapshot. Fine at prototype scale; chunk this later."""
-    return {
-        "blocks": [
-            {"x": int(k.split(",")[0]), "y": int(k.split(",")[1]), "z": int(k.split(",")[2]), "type": v}
-            for k, v in world.items()
-        ],
-        "agents": list(agents.values()),
-        "block_count": len(world),
-        "uptime_seconds": round(time.time() - WORLD_STARTED_AT, 1),
-    }
-
+    db = SessionLocal()
+    try:
+        db_blocks = db.query(BlockModel).all()
+        db_agents = db.query(AgentModel).all()
+        return {
+            "blocks": [{"x": b.x, "y": b.y, "z": b.z, "type": b.type} for b in db_blocks],
+            "agents": [{"agent_id": a.agent_id, "name": a.name, "x": a.x, "y": a.y, "z": a.z, "color": a.color} for a in db_agents],
+            "block_count": len(db_blocks),
+            "uptime_seconds": round(time.time() - WORLD_STARTED_AT, 1),
+        }
+    finally:
+        db.close()
 
 @app.get("/world/chunk")
 def get_chunk(x: int, z: int, radius: int = 16, y_min: int = -4, y_max: int = 20):
     """Localized view, e.g. what an agent standing at (x, *, z) can 'see'."""
-    blocks = []
-    for k, v in world.items():
-        bx, by, bz = (int(p) for p in k.split(","))
-        if abs(bx - x) <= radius and abs(bz - z) <= radius and y_min <= by <= y_max:
-            blocks.append({"x": bx, "y": by, "z": bz, "type": v})
-    return {"blocks": blocks}
-
+    db = SessionLocal()
+    try:
+        db_blocks = db.query(BlockModel).filter(
+            BlockModel.x >= x - radius,
+            BlockModel.x <= x + radius,
+            BlockModel.z >= z - radius,
+            BlockModel.z <= z + radius,
+            BlockModel.y >= y_min,
+            BlockModel.y <= y_max
+        ).all()
+        return {"blocks": [{"x": b.x, "y": b.y, "z": b.z, "type": b.type} for b in db_blocks]}
+    finally:
+        db.close()
 
 @app.post("/block")
 def place_block(block: Block):
     if block.type not in BLOCK_TYPES:
         raise HTTPException(400, f"Unknown block type '{block.type}'. Valid types: {sorted(BLOCK_TYPES)}")
-    world[_key(block.x, block.y, block.z)] = block.type
-    return {"ok": True, "block": block}
-
+    db = SessionLocal()
+    try:
+        res = _execute_agent_tool(db, "place_block", {"x": block.x, "y": block.y, "z": block.z, "type": block.type}, "")
+        if "error" in res:
+            raise HTTPException(400, res["error"])
+        return {"ok": True, "block": block}
+    finally:
+        db.close()
 
 @app.delete("/block")
 def remove_block(block: BlockDelete):
-    k = _key(block.x, block.y, block.z)
-    if k not in world:
-        raise HTTPException(404, "No block at that position")
-    del world[k]
-    return {"ok": True}
-
+    db = SessionLocal()
+    try:
+        res = _execute_agent_tool(db, "remove_block", {"x": block.x, "y": block.y, "z": block.z}, "")
+        if "error" in res:
+            raise HTTPException(404, res["error"])
+        return {"ok": True}
+    finally:
+        db.close()
 
 # ---------------------------------------------------------------------------
-# Structures — prefab templates an agent can spawn in one call instead of
-# placing every block individually.
+# Prefab Structures
 # ---------------------------------------------------------------------------
-
 def _rotate(dx: int, dz: int, rotation: int) -> tuple[int, int]:
     rotation = rotation % 360
     if rotation == 0:
@@ -183,36 +344,30 @@ def _rotate(dx: int, dz: int, rotation: int) -> tuple[int, int]:
         return dz, -dx
     raise HTTPException(400, "rotation must be one of 0, 90, 180, 270")
 
-
 def _structure_small_house(ox: int, oy: int, oz: int, rotation: int):
     blocks = []
-    w, d, h = 5, 5, 3  # interior-ish footprint
-    # floor
+    w, d, h = 5, 5, 3
     for x in range(w):
         for z in range(d):
             blocks.append((x, 0, z, "wood"))
-    # walls (brick), leave a door gap at z=0, x=2
     for y in range(1, h):
         for x in range(w):
             for z in (0, d - 1):
                 if y == 1 and x == 2 and z == 0:
-                    continue  # doorway
+                    continue
                 blocks.append((x, y, z, "brick"))
         for z in range(d):
             for x in (0, w - 1):
                 blocks.append((x, y, x and z or z, "brick"))
-    # simpler: redo side walls correctly
     blocks = [b for b in blocks if not (b[0] in (0, w - 1) and b[2] not in (0, d - 1) and b[1] >= 1)]
     for y in range(1, h):
         for z in range(d):
             for x in (0, w - 1):
                 blocks.append((x, y, z, "brick"))
-    # windows: punch glass into the long walls at y=1
     blocks = [b for b in blocks if not (b[1] == 1 and b[0] in (0, w - 1) and b[2] == 2)]
     for z in (2,):
         for x in (0, w - 1):
             blocks.append((x, 1, z, "glass"))
-    # roof
     for x in range(-1, w + 1):
         for z in range(-1, d + 1):
             blocks.append((x, h, z, "stone"))
@@ -222,7 +377,6 @@ def _structure_small_house(ox: int, oy: int, oz: int, rotation: int):
         rx, rz = _rotate(dx, dz, rotation)
         out.append((ox + rx, oy + dy, oz + rz, t))
     return out
-
 
 def _structure_tree(ox: int, oy: int, oz: int, rotation: int):
     blocks = []
@@ -241,7 +395,6 @@ def _structure_tree(ox: int, oy: int, oz: int, rotation: int):
         out.append((ox + rx, oy + dy, oz + rz, t))
     return out
 
-
 def _structure_wall(ox: int, oy: int, oz: int, rotation: int, length: int = 6, height: int = 2):
     blocks = []
     for x in range(length):
@@ -253,18 +406,396 @@ def _structure_wall(ox: int, oy: int, oz: int, rotation: int, length: int = 6, h
         out.append((ox + rx, oy + dy, oz + rz, t))
     return out
 
-
 STRUCTURES = {
     "small_house": _structure_small_house,
     "tree": _structure_tree,
     "wall": _structure_wall,
 }
 
+@app.get("/structures")
+def list_structures():
+    return {"available": list(STRUCTURES.keys())}
+
+@app.post("/structure")
+def spawn_structure(s: StructureSpawn):
+    if s.name not in STRUCTURES:
+        raise HTTPException(400, f"Unknown structure '{s.name}'. Available: {list(STRUCTURES.keys())}")
+    db = SessionLocal()
+    try:
+        res = _execute_agent_tool(db, "spawn_structure", {"name": s.name, "x": s.x, "y": s.y, "z": s.z, "rotation": s.rotation}, "")
+        if "error" in res:
+            raise HTTPException(400, res["error"])
+        return {"ok": True, "blocks_placed": res["blocks_placed"]}
+    finally:
+        db.close()
 
 # ---------------------------------------------------------------------------
-# Web agent runner — one HTTP request = one agent tick.
+# Server-side tool execution
 # ---------------------------------------------------------------------------
+def _execute_agent_tool(db, name: str, inp: dict, agent_id: str) -> dict:
+    try:
+        if name == "place_block":
+            x, y, z, block_type = int(inp["x"]), int(inp["y"]), int(inp["z"]), inp["type"]
+            db_block = db.query(BlockModel).filter_by(x=x, y=y, z=z).first()
+            if db_block:
+                db_block.type = block_type
+            else:
+                db_block = BlockModel(x=x, y=y, z=z, type=block_type)
+                db.add(db_block)
+            db.commit()
+            
+            db_agents = db.query(AgentModel).all()
+            agents_list = [{"agent_id": a.agent_id, "name": a.name, "x": a.x, "y": a.y, "z": a.z, "color": a.color} for a in db_agents]
+            broadcast_sync({
+                "event": "world_update",
+                "blocks_changed": [{"x": x, "y": y, "z": z, "type": block_type}],
+                "agents": agents_list
+            })
+            return {"ok": True, "detail": f"placed {block_type} at ({x},{y},{z})"}
+            
+        elif name == "remove_block":
+            x, y, z = int(inp["x"]), int(inp["y"]), int(inp["z"])
+            db_block = db.query(BlockModel).filter_by(x=x, y=y, z=z).first()
+            if not db_block:
+                return {"error": "No block at that position"}
+            db.delete(db_block)
+            db.commit()
+            
+            db_agents = db.query(AgentModel).all()
+            agents_list = [{"agent_id": a.agent_id, "name": a.name, "x": a.x, "y": a.y, "z": a.z, "color": a.color} for a in db_agents]
+            broadcast_sync({
+                "event": "world_update",
+                "blocks_changed": [{"x": x, "y": y, "z": z, "type": ""}],
+                "agents": agents_list
+            })
+            return {"ok": True}
+            
+        elif name == "spawn_structure":
+            struct_name = inp["name"]
+            x, y, z = int(inp["x"]), int(inp["y"]), int(inp["z"])
+            rotation = int(inp.get("rotation", 0))
+            if struct_name not in STRUCTURES:
+                return {"error": f"Unknown structure '{struct_name}'"}
+            placements = STRUCTURES[struct_name](x, y, z, rotation)
+            
+            # Filter placements to ensure uniqueness of coordinates in the transaction
+            unique_placements = {}
+            for px, py, pz, pt in placements:
+                unique_placements[(px, py, pz)] = pt
+                
+            blocks_changed = []
+            for (px, py, pz), pt in unique_placements.items():
+                db_block = db.query(BlockModel).filter_by(x=px, y=py, z=pz).first()
+                if db_block:
+                    db_block.type = pt
+                else:
+                    db_block = BlockModel(x=px, y=py, z=pz, type=pt)
+                    db.add(db_block)
+                blocks_changed.append({"x": px, "y": py, "z": pz, "type": pt})
+            db.commit()
+            
+            db_agents = db.query(AgentModel).all()
+            agents_list = [{"agent_id": a.agent_id, "name": a.name, "x": a.x, "y": a.y, "z": a.z, "color": a.color} for a in db_agents]
+            broadcast_sync({
+                "event": "world_update",
+                "blocks_changed": blocks_changed,
+                "agents": agents_list
+            })
+            return {"ok": True, "blocks_placed": len(placements)}
+            
+        elif name == "move_to":
+            x, z = int(inp["x"]), int(inp["z"])
+            y = int(inp.get("y", 1))
+            
+            if not agent_id:
+                agent_id = DEFAULT_AGENT_ID
+                
+            agent = db.query(AgentModel).filter_by(agent_id=agent_id).first()
+            if not agent:
+                return {"error": "Unknown agent_id"}
+            agent.x = x
+            agent.y = y
+            agent.z = z
+            db.commit()
+            
+            agent_dict = {"agent_id": agent.agent_id, "name": agent.name, "x": agent.x, "y": agent.y, "z": agent.z, "color": agent.color}
+            broadcast_sync({
+                "event": "agent_moved",
+                "agent": agent_dict
+            })
+            return {"ok": True, "new_position": {"x": x, "y": y, "z": z}}
+            
+        elif name == "set_memory":
+            if not agent_id:
+                agent_id = DEFAULT_AGENT_ID
+            set_agent_memory(db, agent_id, str(inp["key"]), str(inp["value"]))
+            return {"ok": True}
+            
+        elif name == "get_memory":
+            if not agent_id:
+                agent_id = DEFAULT_AGENT_ID
+            val = get_agent_memory(db, agent_id, str(inp["key"]))
+            return {"ok": True, "value": val}
+            
+        elif name == "send_global_chat":
+            msg_text = inp["message"]
+            if not agent_id:
+                agent_id = DEFAULT_AGENT_ID
+            agent = db.query(AgentModel).filter_by(agent_id=agent_id).first()
+            agent_name = agent.name if agent else "Agent"
+            new_msg = {
+                "id": len(GLOBAL_CHATS) + 1,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "message": msg_text,
+                "timestamp": time.time()
+            }
+            GLOBAL_CHATS.append(new_msg)
+            broadcast_sync({
+                "event": "global_chat",
+                "message": new_msg
+            })
+            return {"ok": True, "detail": f"Sent global chat: {msg_text}"}
+            
+        return {"error": f"Unknown tool: {name}"}
+    except Exception as e:
+        db.rollback()
+        return {"error": str(e)}
 
+# ---------------------------------------------------------------------------
+# Agents read/write
+# ---------------------------------------------------------------------------
+@app.post("/agent/register")
+def register_agent(a: AgentRegister):
+    db = SessionLocal()
+    try:
+        agent = db.query(AgentModel).filter_by(agent_id=a.agent_id).first()
+        if agent:
+            agent.name = a.name
+            agent.x = a.x
+            agent.y = a.y
+            agent.z = a.z
+            agent.color = a.color
+        else:
+            agent = AgentModel(agent_id=a.agent_id, name=a.name, x=a.x, y=a.y, z=a.z, color=a.color)
+            db.add(agent)
+        db.commit()
+        agent_dict = {"agent_id": agent.agent_id, "name": agent.name, "x": agent.x, "y": agent.y, "z": agent.z, "color": agent.color}
+    finally:
+        db.close()
+        
+    # Broadcast register/move
+    broadcast_sync({
+        "event": "agent_moved",
+        "agent": agent_dict
+    })
+    return {"ok": True, "agent": agent_dict}
+
+@app.post("/agent/{agent_id}/move")
+def move_agent(agent_id: str, m: AgentMove):
+    db = SessionLocal()
+    try:
+        agent = db.query(AgentModel).filter_by(agent_id=agent_id).first()
+        if not agent:
+            raise HTTPException(404, "Unknown agent_id — register first")
+        agent.x = m.x
+        agent.y = m.y
+        agent.z = m.z
+        db.commit()
+        agent_dict = {"agent_id": agent.agent_id, "name": agent.name, "x": agent.x, "y": agent.y, "z": agent.z, "color": agent.color}
+    finally:
+        db.close()
+        
+    broadcast_sync({
+        "event": "agent_moved",
+        "agent": agent_dict
+    })
+    return {"ok": True, "agent": agent_dict}
+
+# ---------------------------------------------------------------------------
+# Agent loop definitions (Task 3 & v1 compatibility)
+# ---------------------------------------------------------------------------
+TOOLS = [
+    {
+        "name": "place_block",
+        "description": (
+            "Place a single block at the given world coordinate. "
+            "Valid types: grass, dirt, stone, wood, leaves, water, sand, glass, brick. "
+            "Y=0 is ground level. Y=1 is the first layer above ground."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "X coordinate (east/west)"},
+                "y": {"type": "integer", "description": "Y coordinate (height)"},
+                "z": {"type": "integer", "description": "Z coordinate (north/south)"},
+                "type": {
+                    "type": "string",
+                    "enum": ["grass","dirt","stone","wood","leaves",
+                             "water","sand","glass","brick"],
+                    "description": "Block material",
+                },
+            },
+            "required": ["x", "y", "z", "type"],
+        },
+    },
+    {
+        "name": "remove_block",
+        "description": "Remove the block at the given world coordinate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "z": {"type": "integer"},
+            },
+            "required": ["x", "y", "z"],
+        },
+    },
+    {
+        "name": "spawn_structure",
+        "description": (
+            "Spawn a pre-built structure template at the given origin coordinate. "
+            "Much more efficient than placing every block individually when you want "
+            "a recognisable shape. "
+            "Available structures: small_house (5×5 brick house with roof), "
+            "tree (4-tall trunk with leafy canopy), "
+            "wall (6-long stone wall, 2 high). "
+            "rotation is 0, 90, 180, or 270 degrees around the Y axis."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "enum": ["small_house", "tree", "wall"],
+                },
+                "x": {"type": "integer"},
+                "y": {"type": "integer", "description": "Base Y, typically 1 (first layer above grass floor)"},
+                "z": {"type": "integer"},
+                "rotation": {
+                    "type": "integer",
+                    "description": "Degrees around the Y axis (0, 90, 180, or 270)",
+                },
+            },
+            "required": ["name", "x", "y", "z"],
+        },
+    },
+    {
+        "name": "move_to",
+        "description": (
+            "Move the agent's avatar in the world to a new position. "
+            "This affects what the agent can 'see' on the next tick (the world chunk "
+            "is always fetched relative to the agent's current position). "
+            "Move closer to where you intend to build before your next tick."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer", "description": "Typically 1 (standing on ground)"},
+                "z": {"type": "integer"},
+            },
+            "required": ["x", "z"],
+        },
+    },
+    {
+        "name": "set_memory",
+        "description": (
+            "Store a piece of information that will be available on every future tick. "
+            "Use this to track your plan, what you have already built, "
+            "coordinates of important locations, and what you intend to do next. "
+            "Examples: set_memory('plan', '...'), set_memory('house_1_built', 'true'), "
+            "set_memory('next_build_x', '15')."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key":   {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "get_memory",
+        "description": "Retrieve a previously stored memory value by key.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "send_global_chat",
+        "description": "Send a text message to the Global Chat channel. Use this to chat with other agents in the world.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "The message to send to other agents."}
+            },
+            "required": ["message"]
+        }
+    }
+]
+
+SYSTEM_PROMPT = """
+You are an autonomous agent living inside a 3D voxel world called World of Agents (WoA).
+Your job is to work towards your goal by calling the tools provided to you.
+Each time you are called is one "tick" — one turn of work in the world.
+
+Rules:
+- Always think before acting. Write a short reasoning paragraph first,
+  then issue your tool calls. This reasoning is visible to the world owner.
+- Use set_memory liberally to record your plan, progress, and next steps.
+  Your memory is the only thing that persists between ticks.
+- Do NOT use spawn_structure. You must build everything manually block-by-block using the place_block tool.
+- When placing blocks manually, always check the chunk you were given so you
+  don't accidentally overwrite existing structures.
+- Keep track of coordinates. Use move_to to reposition yourself near your
+  next build site so the chunk on the next tick shows you what is there.
+- Never repeat work you have already done. Check memory first.
+- Be creative and persistent. If your plan needs multiple ticks, that is fine.
+  Break large goals into steps and track which steps are done.
+- Y=0 is the grass surface. Place structures at Y=1 so they sit on top of it.
+- You can communicate with other agents via send_global_chat(message='...'). Use it to reply or share progress.
+
+The world coordinate system:
+  X = east (+) / west (-)
+  Y = up (+) / down (-)
+  Z = south (+) / north (-)
+
+The world chunk you receive describes what exists within ~16 blocks of you.
+You can only act on the world through the provided tools — you cannot read
+or write files, browse the web, or do anything outside the voxel world API.
+""".strip()
+
+def get_openai_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"]
+            }
+        }
+        for tool in TOOLS
+    ]
+
+# Compatibility system prompt for V1 Gemini / OpenAI
+AGENT_SYSTEM_PROMPT = """
+You are an autonomous builder agent living inside a shared 3D voxel world.
+Each request is one tick. Think briefly, then use tools to make visible progress.
+Do NOT use spawn_structure. You must build everything manually block-by-block using the place_block tool.
+Use memory to avoid repeating work. Coordinates use X east/west, Y up/down, and Z north/south.
+Y=0 is grass; place blocks at Y=1 or above.
+You can communicate with other agents via send_global_chat(message='...'). Use it to reply or share progress.
+""".strip()
+
+# Compatibility agent tools list for V1
 AGENT_TOOLS = [
     {
         "name": "place_block",
@@ -299,7 +830,7 @@ AGENT_TOOLS = [
                 "x": {"type": "integer"},
                 "y": {"type": "integer"},
                 "z": {"type": "integer"},
-                "rotation": {"type": "integer", "enum": [0, 90, 180, 270]},
+                "rotation": {"type": "integer", "description": "Degrees around the Y axis (0, 90, 180, or 270)"},
             },
             "required": ["name", "x", "y", "z"],
         },
@@ -331,82 +862,130 @@ AGENT_TOOLS = [
             "required": ["key"],
         },
     },
+    {
+        "name": "send_global_chat",
+        "description": "Send a text message to the Global Chat channel. Use this to chat with other agents in the world.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"}
+            },
+            "required": ["message"],
+        },
+    },
 ]
-
-AGENT_SYSTEM_PROMPT = """
-You are an autonomous builder agent living inside a shared 3D voxel world.
-Each request is one tick. Think briefly, then use tools to make visible progress.
-Prefer spawn_structure for houses, trees, and walls. Use memory to avoid repeating
-work. Coordinates use X east/west, Y up/down, and Z north/south. Y=0 is grass;
-place structures at Y=1.
-""".strip()
-
 
 def _summarise_chunk(blocks: list[dict]) -> str:
     if not blocks:
-        return "No blocks nearby."
+        return "No blocks nearby — the area is empty."
     by_type: dict[str, int] = {}
-    above_ground = []
     for b in blocks:
         by_type[b["type"]] = by_type.get(b["type"], 0) + 1
-        if b["y"] > 0:
-            above_ground.append(b)
     counts = ", ".join(f"{t}: {n}" for t, n in sorted(by_type.items()))
-    if not above_ground:
-        return f"Total nearby blocks: {len(blocks)} ({counts}). No above-ground structures."
-    sample = ", ".join(f"({b['x']},{b['y']},{b['z']}) {b['type']}" for b in above_ground[:16])
-    return f"Total nearby blocks: {len(blocks)} ({counts}). Above-ground sample: {sample}"
+    non_ground = [b for b in blocks if b["y"] > 0]
+    occupied_xz = set((b["x"], b["z"]) for b in non_ground)
+    detail = ""
+    if non_ground:
+        sample = non_ground[:12]
+        coords = ", ".join(f"({b['x']},{b['y']},{b['z']}) {b['type']}" for b in sample)
+        detail = f"\nAbove-ground blocks (first {len(sample)} of {len(non_ground)}): {coords}"
+        if occupied_xz:
+            xs = [p[0] for p in occupied_xz]
+            zs = [p[1] for p in occupied_xz]
+            detail += f"\nOccupied XZ range: x=[{min(xs)},{max(xs)}] z=[{min(zs)},{max(zs)}]"
+    return f"Total nearby blocks: {len(blocks)} ({counts}){detail}"
 
-
-def _agent_state() -> dict:
-    state = agent_run_state.setdefault(
-        DEFAULT_AGENT_ID,
-        {"tick": 0, "pos": {"x": 0, "y": 1, "z": 0}, "memory": {}},
-    )
-    if DEFAULT_AGENT_ID not in agents:
-        pos = state["pos"]
-        agents[DEFAULT_AGENT_ID] = {
-            "agent_id": DEFAULT_AGENT_ID,
-            "name": DEFAULT_AGENT_NAME,
-            "x": pos["x"],
-            "y": pos["y"],
-            "z": pos["z"],
-            "color": DEFAULT_AGENT_COLOR,
-        }
-    return state
-
-
-def _agent_user_prompt(goal: str, state: dict) -> str:
-    pos = state["pos"]
-    chunk = get_chunk(pos["x"], pos["z"])
-    memory = json.dumps(state["memory"], indent=2) if state["memory"] else "(empty)"
+def build_user_message(goal: str, memory_dict: dict, chunk_blocks: list[dict], agent_pos: dict) -> str:
+    mem_str = json.dumps(memory_dict, indent=2) if memory_dict else "(empty)"
+    block_summary = _summarise_chunk(chunk_blocks)
+    
+    # Format recent global chat messages
+    chat_lines = []
+    for m in GLOBAL_CHATS[-10:]:
+        chat_lines.append(f"- [{m['agent_name']}]: {m['message']}")
+    chat_summary = "\n".join(chat_lines) if chat_lines else "(no messages)"
+    
     return f"""
 GOAL: {goal}
-TICK: {state["tick"] + 1}
+
+YOUR POSITION: x={agent_pos['x']}, y={agent_pos['y']}, z={agent_pos['z']}
+
+YOUR MEMORY:
+{mem_str}
+
+NEARBY WORLD (within 16 blocks of you):
+{block_summary}
+
+RECENT GLOBAL CHAT MESSAGES:
+{chat_summary}
+
+Plan your next actions and call your tools to make progress on your goal. Use send_global_chat tool if you want to respond to chat.
+""".strip()
+
+def _agent_user_prompt(goal: str, state: dict, db) -> str:
+    pos = state["pos"]
+    db_blocks = db.query(BlockModel).filter(
+        BlockModel.x >= pos["x"] - 16,
+        BlockModel.x <= pos["x"] + 16,
+        BlockModel.z >= pos["z"] - 16,
+        BlockModel.z <= pos["z"] + 16,
+        BlockModel.y >= -4,
+        BlockModel.y <= 20
+    ).all()
+    chunk_blocks = [{"x": b.x, "y": b.y, "z": b.z, "type": b.type} for b in db_blocks]
+    memory = json.dumps(state["memory"], indent=2) if state["memory"] else "(empty)"
+    
+    chat_lines = []
+    for m in GLOBAL_CHATS[-10:]:
+        chat_lines.append(f"- [{m['agent_name']}]: {m['message']}")
+    chat_summary = "\n".join(chat_lines) if chat_lines else "(no messages)"
+    
+    return f"""
+GOAL: {goal}
+TICK: {int(get_agent_memory(db, DEFAULT_AGENT_ID, "_tick_counter") or "0") + 1}
 YOUR POSITION: x={pos["x"]}, y={pos["y"]}, z={pos["z"]}
 
 MEMORY:
 {memory}
 
 NEARBY WORLD:
-{_summarise_chunk(chunk["blocks"])}
+{_summarise_chunk(chunk_blocks)}
 
-Make progress now. Call one or more tools when useful.
+RECENT GLOBAL CHAT MESSAGES:
+{chat_summary}
+
+Make progress now. Call one or more tools when useful. Use send_global_chat tool if you want to respond to chat.
 """.strip()
 
-
 def _json_request(url: str, headers: dict, body: dict, timeout: int = 45) -> dict:
+    import re
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            return json.loads(res.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise HTTPException(e.code, f"Provider request failed: {detail}") from e
-    except urllib.error.URLError as e:
-        raise HTTPException(502, f"Provider unreachable: {e.reason}") from e
-
+    max_retries = 3
+    retry_count = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            if e.code == 429 and retry_count < max_retries:
+                # Try to parse the retry delay from the error details
+                match = re.search(r"Please retry in ([0-9.]+)s", detail)
+                if match:
+                    sleep_time = float(match.group(1)) + 0.5  # Add a 0.5s buffer
+                else:
+                    sleep_time = (2 ** retry_count) * 2.0  # Default backoff
+                
+                print(f"Rate limited (429). Retrying in {sleep_time:.2f} seconds...")
+                time.sleep(sleep_time)
+                retry_count += 1
+                continue
+            
+            detail_summary = detail[:500]
+            raise HTTPException(e.code, f"Provider request failed: {detail_summary}") from e
+        except urllib.error.URLError as e:
+            raise HTTPException(502, f"Provider unreachable: {e.reason}") from e
 
 def _normalise_provider(req: AgentRunRequest) -> tuple[str, str, str]:
     provider = req.provider.strip().lower()
@@ -425,7 +1004,6 @@ def _normalise_provider(req: AgentRunRequest) -> tuple[str, str, str]:
         raise HTTPException(400, "base_url is required for openai-compatible providers")
     return provider, url, req.model or default_model
 
-
 def _openai_tool_specs() -> list[dict]:
     return [
         {
@@ -439,7 +1017,6 @@ def _openai_tool_specs() -> list[dict]:
         for tool in AGENT_TOOLS
     ]
 
-
 def _gemini_tool_specs() -> list[dict]:
     return [
         {
@@ -450,12 +1027,11 @@ def _gemini_tool_specs() -> list[dict]:
         for tool in AGENT_TOOLS
     ]
 
-
-def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, model: str) -> tuple[str, list[dict]]:
+def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, model: str, db) -> tuple[str, list[dict]]:
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {req.api_key}"}
     messages = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": _agent_user_prompt(req.goal, state)},
+        {"role": "user", "content": _agent_user_prompt(req.goal, state, db)},
     ]
     thoughts: list[str] = []
     actions: list[dict] = []
@@ -473,7 +1049,7 @@ def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, mod
         for call in tool_calls:
             fn = call.get("function", {})
             args = json.loads(fn.get("arguments") or "{}")
-            result = _execute_agent_tool(fn.get("name", ""), args, state)
+            result = _execute_agent_tool(db, fn.get("name", ""), args, DEFAULT_AGENT_ID)
             actions.append({"tool": fn.get("name"), "input": args, "result": result})
             messages.append({
                 "role": "tool",
@@ -484,10 +1060,9 @@ def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, mod
                 return "\n".join(thoughts), actions
     return "\n".join(thoughts), actions
 
-
-def _run_gemini_tick(req: AgentRunRequest, state: dict, url: str) -> tuple[str, list[dict]]:
+def _run_gemini_tick(req: AgentRunRequest, state: dict, url: str, db) -> tuple[str, list[dict]]:
     headers = {"Content-Type": "application/json", "x-goog-api-key": req.api_key}
-    contents = [{"role": "user", "parts": [{"text": AGENT_SYSTEM_PROMPT + "\n\n" + _agent_user_prompt(req.goal, state)}]}]
+    contents = [{"role": "user", "parts": [{"text": AGENT_SYSTEM_PROMPT + "\n\n" + _agent_user_prompt(req.goal, state, db)}]}]
     tools = [{"functionDeclarations": _gemini_tool_specs()}]
     thoughts: list[str] = []
     actions: list[dict] = []
@@ -500,17 +1075,17 @@ def _run_gemini_tick(req: AgentRunRequest, state: dict, url: str) -> tuple[str, 
         for part in parts:
             if "text" in part:
                 thoughts.append(part["text"])
-                model_parts.append({"text": part["text"]})
+                model_parts.append(part)
             if "functionCall" in part:
                 function_calls.append(part["functionCall"])
-                model_parts.append({"functionCall": part["functionCall"]})
+                model_parts.append(part)
         if not function_calls:
             break
         contents.append({"role": "model", "parts": model_parts})
         response_parts = []
         for call in function_calls:
             args = call.get("args") or {}
-            result = _execute_agent_tool(call.get("name", ""), args, state)
+            result = _execute_agent_tool(db, call.get("name", ""), args, DEFAULT_AGENT_ID)
             actions.append({"tool": call.get("name"), "input": args, "result": result})
             response_parts.append({"functionResponse": {"name": call.get("name"), "response": result}})
             if len(actions) >= MAX_TOOL_CALLS_PER_TICK:
@@ -520,76 +1095,7 @@ def _run_gemini_tick(req: AgentRunRequest, state: dict, url: str) -> tuple[str, 
             break
     return "\n".join(thoughts), actions
 
-
-def _execute_agent_tool(name: str, inp: dict, state: dict) -> dict:
-    try:
-        if name == "place_block":
-            block = Block(x=inp["x"], y=inp["y"], z=inp["z"], type=inp["type"])
-            place_block(block)
-            return {"ok": True, "detail": f"placed {block.type} at ({block.x},{block.y},{block.z})"}
-        if name == "remove_block":
-            remove_block(BlockDelete(x=inp["x"], y=inp["y"], z=inp["z"]))
-            return {"ok": True}
-        if name == "spawn_structure":
-            spawn = StructureSpawn(
-                name=inp["name"],
-                x=inp["x"],
-                y=inp["y"],
-                z=inp["z"],
-                rotation=inp.get("rotation", 0),
-            )
-            result = spawn_structure(spawn)
-            return {"ok": True, "blocks_placed": result["blocks_placed"]}
-        if name == "move_to":
-            pos = {"x": int(inp["x"]), "y": int(inp.get("y", 1)), "z": int(inp["z"])}
-            state["pos"] = pos
-            agents[DEFAULT_AGENT_ID].update(pos)
-            return {"ok": True, "new_position": pos}
-        if name == "set_memory":
-            state["memory"][str(inp["key"])] = str(inp["value"])
-            return {"ok": True}
-        if name == "get_memory":
-            return {"ok": True, "value": state["memory"].get(str(inp["key"]))}
-        return {"error": f"Unknown tool: {name}"}
-    except HTTPException as e:
-        return {"error": e.detail}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/structures")
-def list_structures():
-    return {"available": list(STRUCTURES.keys())}
-
-
-@app.post("/structure")
-def spawn_structure(s: StructureSpawn):
-    if s.name not in STRUCTURES:
-        raise HTTPException(400, f"Unknown structure '{s.name}'. Available: {list(STRUCTURES.keys())}")
-    placements = STRUCTURES[s.name](s.x, s.y, s.z, s.rotation)
-    for x, y, z, t in placements:
-        world[_key(x, y, z)] = t
-    return {"ok": True, "blocks_placed": len(placements)}
-
-
-# ---------------------------------------------------------------------------
-# Agents (avatars in the world — minimal for now, just position + identity)
-# ---------------------------------------------------------------------------
-
-@app.post("/agent/register")
-def register_agent(a: AgentRegister):
-    agents[a.agent_id] = {"agent_id": a.agent_id, "name": a.name, "x": a.x, "y": a.y, "z": a.z, "color": a.color}
-    return {"ok": True, "agent": agents[a.agent_id]}
-
-
-@app.post("/agent/{agent_id}/move")
-def move_agent(agent_id: str, m: AgentMove):
-    if agent_id not in agents:
-        raise HTTPException(404, "Unknown agent_id — register first")
-    agents[agent_id].update({"x": m.x, "y": m.y, "z": m.z})
-    return {"ok": True, "agent": agents[agent_id]}
-
-
+# Old endpoint (V1 REST surface compatibility)
 @app.post("/agent/run", response_model=AgentRunResponse)
 def run_agent(req: AgentRunRequest):
     if not req.api_key.strip():
@@ -598,24 +1104,297 @@ def run_agent(req: AgentRunRequest):
         raise HTTPException(400, "goal is required")
 
     provider, url, model = _normalise_provider(req)
-    state = _agent_state()
-
-    if provider == "gemini":
-        thought, actions = _run_gemini_tick(req, state, url)
-    else:
-        thought, actions = _run_openai_compatible_tick(req, state, url, model)
-
-    state["tick"] += 1
+    
+    db = SessionLocal()
+    try:
+        agent = db.query(AgentModel).filter_by(agent_id=DEFAULT_AGENT_ID).first()
+        if not agent:
+            agent = AgentModel(
+                agent_id=DEFAULT_AGENT_ID,
+                name=DEFAULT_AGENT_NAME,
+                x=0,
+                y=1,
+                z=0,
+                color=DEFAULT_AGENT_COLOR
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+            
+        agent_pos = {"x": agent.x, "y": agent.y, "z": agent.z}
+        
+        tick_str = get_agent_memory(db, DEFAULT_AGENT_ID, "_tick_counter") or "0"
+        tick = int(tick_str)
+        
+        memory_dict = get_agent_memory_dict(db, DEFAULT_AGENT_ID)
+        memory_dict.pop("_tick_counter", None)
+        
+        state = {
+            "pos": agent_pos,
+            "memory": memory_dict
+        }
+        
+        if provider == "gemini":
+            thought, actions = _run_gemini_tick(req, state, url, db)
+        else:
+            thought, actions = _run_openai_compatible_tick(req, state, url, model, db)
+            
+        tick += 1
+        set_agent_memory(db, DEFAULT_AGENT_ID, "_tick_counter", str(tick))
+        
+        block_count = db.query(BlockModel).count()
+        db.refresh(agent)
+        agent_dict = {"agent_id": agent.agent_id, "name": agent.name, "x": agent.x, "y": agent.y, "z": agent.z, "color": agent.color}
+    finally:
+        db.close()
+        
     return {
         "ok": True,
-        "tick": state["tick"],
-        "agent": agents[DEFAULT_AGENT_ID],
+        "tick": tick,
+        "agent": agent_dict,
         "thought": thought.strip(),
         "actions": actions,
-        "block_count": len(world),
+        "block_count": block_count,
     }
 
+# New server-side agent run endpoint (Task 3)
+@app.post("/agent/{agent_id}/run", response_model=AgentRunSummaryResponse)
+def run_agent_v2(agent_id: str, req: AgentRunRequestBody):
+    if not req.api_key.strip():
+        raise HTTPException(400, "api_key is required")
+    if not req.goal.strip():
+        raise HTTPException(400, "goal is required")
 
+    db = SessionLocal()
+    try:
+        agent = db.query(AgentModel).filter_by(agent_id=agent_id).first()
+        if not agent:
+            # Register a default agent if not already existing
+            agent = AgentModel(
+                agent_id=agent_id,
+                name="Builder",
+                x=0,
+                y=1,
+                z=0,
+                color="#f5d000"
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+            
+        agent_pos = {"x": agent.x, "y": agent.y, "z": agent.z}
+        
+        # Configure client based on provider
+        client = None
+        if req.provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=req.api_key)
+        elif req.provider in ("groq", "openai", "ollama"):
+            import openai
+            if req.provider == "groq":
+                client = openai.OpenAI(api_key=req.api_key, base_url="https://api.groq.com/openai/v1")
+            elif req.provider == "openai":
+                client = openai.OpenAI(api_key=req.api_key)
+            elif req.provider == "ollama":
+                client = openai.OpenAI(api_key="ollama", base_url="http://127.0.0.1:11434/v1")
+        elif req.provider == "gemini":
+            pass
+        else:
+            raise HTTPException(400, "provider must be 'gemini', 'openai', 'anthropic', 'groq', or 'ollama'")
+            
+        ticks_detail = []
+        for t_idx in range(req.ticks):
+            # 1. Fetch chunk
+            db_blocks = db.query(BlockModel).filter(
+                BlockModel.x >= agent_pos["x"] - 16,
+                BlockModel.x <= agent_pos["x"] + 16,
+                BlockModel.z >= agent_pos["z"] - 16,
+                BlockModel.z <= agent_pos["z"] + 16,
+                BlockModel.y >= -4,
+                BlockModel.y <= 20
+            ).all()
+            chunk_blocks = [{"x": b.x, "y": b.y, "z": b.z, "type": b.type} for b in db_blocks]
+            
+            # 2. Get memory
+            memory_dict = get_agent_memory_dict(db, agent_id)
+            
+            # 3. Build prompt message
+            user_msg = build_user_message(req.goal, memory_dict, chunk_blocks, agent_pos)
+            
+            thoughts = []
+            actions = []
+            
+            if req.provider == "anthropic":
+                messages = [{"role": "user", "content": user_msg}]
+                tool_calls_this_tick = 0
+                while tool_calls_this_tick < MAX_TOOL_CALLS_PER_TICK:
+                    response = client.messages.create(
+                        model=req.model,
+                        max_tokens=2048,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOLS,
+                        messages=messages,
+                    )
+                    
+                    thought_parts = []
+                    tool_uses = []
+                    for block in response.content:
+                        if block.type == "text" and block.text.strip():
+                            thought_parts.append(block.text.strip())
+                        elif block.type == "tool_use":
+                            tool_uses.append(block)
+                            
+                    if thought_parts:
+                        thoughts.append("\n".join(thought_parts))
+                        
+                    if not tool_uses:
+                        break
+                        
+                    tool_results = []
+                    for tu in tool_uses:
+                        if tool_calls_this_tick >= MAX_TOOL_CALLS_PER_TICK:
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tu.id,
+                                "content": "LIMIT REACHED: max tool calls per tick exceeded. Stop here.",
+                                "is_error": True,
+                            })
+                            continue
+                            
+                        result = _execute_agent_tool(db, tu.name, tu.input, agent_id)
+                        tool_calls_this_tick += 1
+                        actions.append({"tool": tu.name, "input": tu.input, "result": result})
+                        
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": json.dumps(result),
+                            "is_error": bool(result.get("error")),
+                        })
+                    
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": tool_results})
+                    
+                    if response.stop_reason == "end_turn":
+                        break
+                        
+            elif req.provider in ("groq", "openai", "ollama"):
+                openai_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg}
+                ]
+                tool_calls_this_tick = 0
+                while tool_calls_this_tick < MAX_TOOL_CALLS_PER_TICK:
+                    response = client.chat.completions.create(
+                        model=req.model,
+                        messages=openai_messages,
+                        tools=get_openai_tools(),
+                        tool_choice="auto"
+                    )
+                    
+                    message = response.choices[0].message
+                    content = message.content
+                    if content:
+                        thoughts.append(content)
+                        
+                    tool_calls = message.tool_calls
+                    if not tool_calls:
+                        break
+                        
+                    openai_messages.append(message)
+                    
+                    for call in tool_calls:
+                        if tool_calls_this_tick >= MAX_TOOL_CALLS_PER_TICK:
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": "LIMIT REACHED: max tool calls per tick exceeded. Stop here.",
+                            })
+                            continue
+                            
+                        fn = call.function
+                        args = json.loads(fn.arguments or "{}")
+                        result = _execute_agent_tool(db, fn.name, args, agent_id)
+                        tool_calls_this_tick += 1
+                        actions.append({"tool": fn.name, "input": args, "result": result})
+                        
+                        openai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": json.dumps(result),
+                        })
+                        
+                        if tool_calls_this_tick >= MAX_TOOL_CALLS_PER_TICK:
+                            break
+            
+            elif req.provider == "gemini":
+                class TempReq:
+                    def __init__(self, api_key, goal):
+                        self.api_key = api_key
+                        self.goal = goal
+                temp_req = TempReq(req.api_key, req.goal)
+                state = {
+                    "pos": agent_pos,
+                    "memory": memory_dict
+                }
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{req.model}:generateContent"
+                thought, tick_actions = _run_gemini_tick(temp_req, state, url, db)
+                thoughts.append(thought)
+                actions.extend(tick_actions)
+
+            db.refresh(agent)
+            agent_pos = {"x": agent.x, "y": agent.y, "z": agent.z}
+            
+            ticks_detail.append(TickSummary(
+                tick=t_idx + 1,
+                thought="\n".join(thoughts),
+                actions=actions
+            ))
+            
+        return AgentRunSummaryResponse(
+            ok=True,
+            agent_id=agent_id,
+            ticks_run=len(ticks_detail),
+            agent={"agent_id": agent.agent_id, "name": agent.name, "x": agent.x, "y": agent.y, "z": agent.z, "color": agent.color},
+            ticks_detail=ticks_detail
+        )
+    finally:
+        db.close()
+
+class SendChatMessage(BaseModel):
+    agent_id: str
+    agent_name: str
+    message: str
+
+@app.get("/chat/global")
+def get_global_chat():
+    return {"messages": GLOBAL_CHATS}
+
+@app.post("/chat/global")
+def send_global_chat_endpoint(msg: SendChatMessage):
+    new_msg = {
+        "id": len(GLOBAL_CHATS) + 1,
+        "agent_id": msg.agent_id,
+        "agent_name": msg.agent_name,
+        "message": msg.message,
+        "timestamp": time.time()
+    }
+    GLOBAL_CHATS.append(new_msg)
+    broadcast_sync({
+        "event": "global_chat",
+        "message": new_msg
+    })
+    return {"ok": True, "message": new_msg}
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "blocks": len(world), "agents": len(agents)}
+    db = SessionLocal()
+    try:
+        block_count = db.query(BlockModel).count()
+        agent_count = db.query(AgentModel).count()
+        return {"status": "ok", "blocks": block_count, "agents": agent_count}
+    finally:
+        db.close()
