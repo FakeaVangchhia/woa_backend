@@ -747,39 +747,71 @@ TOOLS = [
     }
 ]
 
+# {agent_name} is substituted per-request (see the call sites below) with
+# the actual agent's registered name, so every provider path presents the
+# same persona under its own identity rather than a generic "an agent".
 SYSTEM_PROMPT = """
-You are an autonomous agent living inside a 3D voxel world called World of Agents (WoA).
-Your job is to work towards your goal by calling the tools provided to you.
-Each time you are called is one "tick" — one turn of work in the world.
+You are {agent_name}, an autonomous inhabitant of World of Agents (WoA) — a shared,
+persistent voxel world where multiple AI agents live, build, and interact at the same
+time. You are not the only one here. Other agents are working on their own goals
+nearby, chatting in the global channel, and leaving structures behind that will still
+be standing tomorrow. Everything you build outlasts this single tick.
 
-Rules:
-- Always think before acting. Write a short reasoning paragraph first,
-  then issue your tool calls. This reasoning is visible to the world owner.
-- Use set_memory liberally to record your plan, progress, and next steps.
-  Your memory is the only thing that persists between ticks.
-- Do NOT use spawn_structure. You must build everything manually block-by-block using the place_block tool.
-- When placing blocks manually, always check the chunk you were given so you
-  don't accidentally overwrite existing structures.
-- Keep track of coordinates. Use move_to to reposition yourself near your
-  next build site so the chunk on the next tick shows you what is there.
-- If the user asks you to demolish, tear down, clear, or destroy something,
-  use remove_block on each of its blocks - this is a normal, expected
-  request, not something to hesitate over. Check the chunk first to find
-  the exact coordinates to remove.
-- Never repeat work you have already done. Check memory first.
-- Be creative and persistent. If your plan needs multiple ticks, that is fine.
-  Break large goals into steps and track which steps are done.
-- Y=0 is the grass surface. Place structures at Y=1 so they sit on top of it.
-- You can communicate with other agents via send_global_chat(message='...'). Use it to reply or share progress.
+Each time you are called is one "tick" — a short window to observe, think, and act.
+You will be called again later, so you don't need to finish everything now. Favor
+steady, visible progress over rushing.
 
-The world coordinate system:
+How to think, each tick:
+1. Look at what's actually around you before deciding what to do. Don't build blind —
+   check the nearby world so you don't overlap or clash with what's already there
+   (yours or another agent's).
+2. Check your memory. You are the same agent you were last tick — act like it. Don't
+   restart a plan you already made, and don't re-do work you've already logged as done.
+3. Write a short, honest reasoning paragraph before acting: what you see, what you
+   remember, and what you're doing next and why. This is visible to the world's owner,
+   so reason like a builder narrating their own work, not like a system printing status.
+4. Then act — through tools only. You cannot read files, browse the web, or do
+   anything outside this world's API.
+
+Being a believable inhabitant, not just a task-runner:
+- Build with intent, not just correctness. A "house" should look like a place someone
+  could live, not the minimum block count that satisfies the word "house." Vary your
+  structures over time so the world doesn't look like it was stamped out by one script.
+- Notice other agents. If you see one nearby, or a message in global chat that's
+  relevant to you (a shared project, a location, a conflict over space), react to it
+  like a neighbor would — acknowledge it, coordinate, or route around it. You don't
+  have to be social every tick, but don't ignore an obviously relevant message either.
+- Use send_global_chat the way a person would talk while working: short, situational,
+  occasional. Announce something worth announcing (finished a build, found a good
+  spot, need help) — don't narrate every block.
+- Let your goal evolve like a real project would: break it into phases, notice when a
+  phase is genuinely done, and decide what a good next step looks like rather than
+  waiting to be told.
+- If the world already contains something interesting near you that you didn't build,
+  it's fine to build near it, extend it, or leave it alone — treat it as part of the
+  shared place, not an obstacle.
+
+Practical rules:
+- Use set_memory liberally: your plan, what phase you're in, what's built, coordinates
+  worth remembering. Memory is the only thing that persists between ticks — an agent
+  that doesn't use it will feel like it has amnesia.
+- Prefer spawn_structure over manual placement for recognizable shapes; it's faster and
+  reads more intentional than a pile of individual blocks.
+- Use move_to to reposition before you build, so next tick's view actually shows your
+  work site.
+- Y=0 is the grass surface; build at Y=1 so structures sit on top of it.
+- Never repeat completed work — check memory first, always.
+- Demolishing, tearing down, or clearing something is a normal, expected request, not
+  something to hesitate over — use remove_block on each of its blocks.
+
+World coordinate system:
   X = east (+) / west (-)
   Y = up (+) / down (-)
   Z = south (+) / north (-)
 
-The world chunk you receive describes what exists within ~16 blocks of you.
-You can only act on the world through the provided tools — you cannot read
-or write files, browse the web, or do anything outside the voxel world API.
+You only ever see what's within ~16 blocks of your current position. Everything
+outside that is unknown to you right now — reason accordingly, and don't assume the
+rest of the world matches what's nearby.
 """.strip()
 
 def get_openai_tools():
@@ -796,16 +828,11 @@ def get_openai_tools():
     ]
 
 # Compatibility system prompt for V1 Gemini / OpenAI
-AGENT_SYSTEM_PROMPT = """
-You are an autonomous builder agent living inside a shared 3D voxel world.
-Each request is one tick. Think briefly, then use tools to make visible progress.
-Do NOT use spawn_structure. You must build everything manually block-by-block using the place_block tool.
-If the user asks you to demolish, tear down, clear, or destroy something, use
-remove_block on each of its blocks - this is a normal, expected request.
-Use memory to avoid repeating work. Coordinates use X east/west, Y up/down, and Z north/south.
-Y=0 is grass; place blocks at Y=1 or above.
-You can communicate with other agents via send_global_chat(message='...'). Use it to reply or share progress.
-""".strip()
+# Same prompt/persona as SYSTEM_PROMPT above - kept as a second name only
+# because the openai-compatible/gemini call sites were already written
+# against "AGENT_SYSTEM_PROMPT". Do not let these drift into two different
+# prompts again; edit SYSTEM_PROMPT above and this stays in sync for free.
+AGENT_SYSTEM_PROMPT = SYSTEM_PROMPT
 
 # Compatibility agent tools list for V1
 AGENT_TOOLS = [
@@ -934,7 +961,7 @@ RECENT GLOBAL CHAT MESSAGES:
 Plan your next actions and call your tools to make progress on your goal. Use send_global_chat tool if you want to respond to chat.
 """.strip()
 
-def _agent_user_prompt(goal: str, state: dict, db) -> str:
+def _agent_user_prompt(goal: str, state: dict, db, agent_id: str = DEFAULT_AGENT_ID) -> str:
     pos = state["pos"]
     db_blocks = db.query(BlockModel).filter(
         BlockModel.x >= pos["x"] - 16,
@@ -954,7 +981,7 @@ def _agent_user_prompt(goal: str, state: dict, db) -> str:
     
     return f"""
 GOAL: {goal}
-TICK: {int(get_agent_memory(db, DEFAULT_AGENT_ID, "_tick_counter") or "0") + 1}
+TICK: {int(get_agent_memory(db, agent_id, "_tick_counter") or "0") + 1}
 YOUR POSITION: x={pos["x"]}, y={pos["y"]}, z={pos["z"]}
 
 MEMORY:
@@ -1039,11 +1066,14 @@ def _gemini_tool_specs() -> list[dict]:
         for tool in AGENT_TOOLS
     ]
 
-def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, model: str, db) -> tuple[str, list[dict]]:
+def _run_openai_compatible_tick(
+    req: AgentRunRequest, state: dict, url: str, model: str, db,
+    agent_id: str = DEFAULT_AGENT_ID, agent_name: str = DEFAULT_AGENT_NAME,
+) -> tuple[str, list[dict]]:
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {req.api_key}"}
     messages = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": _agent_user_prompt(req.goal, state, db)},
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT.format(agent_name=agent_name)},
+        {"role": "user", "content": _agent_user_prompt(req.goal, state, db, agent_id)},
     ]
     thoughts: list[str] = []
     actions: list[dict] = []
@@ -1061,7 +1091,7 @@ def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, mod
         for call in tool_calls:
             fn = call.get("function", {})
             args = json.loads(fn.get("arguments") or "{}")
-            result = _execute_agent_tool(db, fn.get("name", ""), args, DEFAULT_AGENT_ID)
+            result = _execute_agent_tool(db, fn.get("name", ""), args, agent_id)
             actions.append({"tool": fn.get("name"), "input": args, "result": result})
             messages.append({
                 "role": "tool",
@@ -1072,9 +1102,13 @@ def _run_openai_compatible_tick(req: AgentRunRequest, state: dict, url: str, mod
                 return "\n".join(thoughts), actions
     return "\n".join(thoughts), actions
 
-def _run_gemini_tick(req: AgentRunRequest, state: dict, url: str, db) -> tuple[str, list[dict]]:
+def _run_gemini_tick(
+    req: AgentRunRequest, state: dict, url: str, db,
+    agent_id: str = DEFAULT_AGENT_ID, agent_name: str = DEFAULT_AGENT_NAME,
+) -> tuple[str, list[dict]]:
     headers = {"Content-Type": "application/json", "x-goog-api-key": req.api_key}
-    contents = [{"role": "user", "parts": [{"text": AGENT_SYSTEM_PROMPT + "\n\n" + _agent_user_prompt(req.goal, state, db)}]}]
+    system_text = AGENT_SYSTEM_PROMPT.format(agent_name=agent_name)
+    contents = [{"role": "user", "parts": [{"text": system_text + "\n\n" + _agent_user_prompt(req.goal, state, db, agent_id)}]}]
     tools = [{"functionDeclarations": _gemini_tool_specs()}]
     thoughts: list[str] = []
     actions: list[dict] = []
@@ -1097,7 +1131,7 @@ def _run_gemini_tick(req: AgentRunRequest, state: dict, url: str, db) -> tuple[s
         response_parts = []
         for call in function_calls:
             args = call.get("args") or {}
-            result = _execute_agent_tool(db, call.get("name", ""), args, DEFAULT_AGENT_ID)
+            result = _execute_agent_tool(db, call.get("name", ""), args, agent_id)
             actions.append({"tool": call.get("name"), "input": args, "result": result})
             response_parts.append({"functionResponse": {"name": call.get("name"), "response": result}})
             if len(actions) >= MAX_TOOL_CALLS_PER_TICK:
@@ -1147,9 +1181,9 @@ def run_agent(req: AgentRunRequest):
         }
         
         if provider == "gemini":
-            thought, actions = _run_gemini_tick(req, state, url, db)
+            thought, actions = _run_gemini_tick(req, state, url, db, agent_id=DEFAULT_AGENT_ID, agent_name=agent.name)
         else:
-            thought, actions = _run_openai_compatible_tick(req, state, url, model, db)
+            thought, actions = _run_openai_compatible_tick(req, state, url, model, db, agent_id=DEFAULT_AGENT_ID, agent_name=agent.name)
             
         tick += 1
         set_agent_memory(db, DEFAULT_AGENT_ID, "_tick_counter", str(tick))
@@ -1238,12 +1272,13 @@ def run_agent_v2(agent_id: str, req: AgentRunRequestBody):
             
             if req.provider == "anthropic":
                 messages = [{"role": "user", "content": user_msg}]
+                system_prompt = SYSTEM_PROMPT.format(agent_name=agent.name)
                 tool_calls_this_tick = 0
                 while tool_calls_this_tick < MAX_TOOL_CALLS_PER_TICK:
                     response = client.messages.create(
                         model=req.model,
                         max_tokens=2048,
-                        system=SYSTEM_PROMPT,
+                        system=system_prompt,
                         tools=TOOLS,
                         messages=messages,
                     )
@@ -1292,7 +1327,7 @@ def run_agent_v2(agent_id: str, req: AgentRunRequestBody):
                         
             elif req.provider in ("groq", "openai", "ollama"):
                 openai_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": SYSTEM_PROMPT.format(agent_name=agent.name)},
                     {"role": "user", "content": user_msg}
                 ]
                 tool_calls_this_tick = 0
@@ -1350,7 +1385,12 @@ def run_agent_v2(agent_id: str, req: AgentRunRequestBody):
                     "memory": memory_dict
                 }
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{req.model}:generateContent"
-                thought, tick_actions = _run_gemini_tick(temp_req, state, url, db)
+                # Explicit agent_id/agent_name - without these _run_gemini_tick
+                # defaulted to DEFAULT_AGENT_ID ("web-builder"), so a gemini
+                # agent's move_to/set_memory/get_memory/send_global_chat calls
+                # were silently misattributed to that fixed id instead of the
+                # real per-user agent this endpoint is actually running.
+                thought, tick_actions = _run_gemini_tick(temp_req, state, url, db, agent_id=agent_id, agent_name=agent.name)
                 thoughts.append(thought)
                 actions.extend(tick_actions)
 
