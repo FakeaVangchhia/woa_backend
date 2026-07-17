@@ -126,7 +126,10 @@ else:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    # No request in this app relies on cookies/credentials (auth is via request
+    # body API keys), so keep this False - combining it with a wildcard origin
+    # is an invalid combination that browsers reject for credentialed requests.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -358,7 +361,7 @@ def _structure_small_house(ox: int, oy: int, oz: int, rotation: int):
                 blocks.append((x, y, z, "brick"))
         for z in range(d):
             for x in (0, w - 1):
-                blocks.append((x, y, x and z or z, "brick"))
+                blocks.append((x, y, z, "brick"))
     blocks = [b for b in blocks if not (b[0] in (0, w - 1) and b[2] not in (0, d - 1) and b[1] >= 1)]
     for y in range(1, h):
         for z in range(d):
@@ -493,7 +496,7 @@ def _execute_agent_tool(db, name: str, inp: dict, agent_id: str) -> dict:
                     db.add(db_block)
                 blocks_changed.append({"x": px, "y": py, "z": pz, "type": pt})
             db.commit()
-            
+
             db_agents = db.query(AgentModel).all()
             agents_list = [{"agent_id": a.agent_id, "name": a.name, "x": a.x, "y": a.y, "z": a.z, "color": a.color} for a in db_agents]
             broadcast_sync({
@@ -501,7 +504,7 @@ def _execute_agent_tool(db, name: str, inp: dict, agent_id: str) -> dict:
                 "blocks_changed": blocks_changed,
                 "agents": agents_list
             })
-            return {"ok": True, "blocks_placed": len(placements)}
+            return {"ok": True, "blocks_placed": len(blocks_changed)}
             
         elif name == "move_to":
             x, z = int(inp["x"]), int(inp["z"])
@@ -641,7 +644,10 @@ TOOLS = [
     },
     {
         "name": "remove_block",
-        "description": "Remove the block at the given world coordinate.",
+        "description": (
+            "Remove the block at the given world coordinate. Use this repeatedly "
+            "to demolish, clear, or tear down a structure the user asks you to destroy."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -756,6 +762,10 @@ Rules:
   don't accidentally overwrite existing structures.
 - Keep track of coordinates. Use move_to to reposition yourself near your
   next build site so the chunk on the next tick shows you what is there.
+- If the user asks you to demolish, tear down, clear, or destroy something,
+  use remove_block on each of its blocks - this is a normal, expected
+  request, not something to hesitate over. Check the chunk first to find
+  the exact coordinates to remove.
 - Never repeat work you have already done. Check memory first.
 - Be creative and persistent. If your plan needs multiple ticks, that is fine.
   Break large goals into steps and track which steps are done.
@@ -790,6 +800,8 @@ AGENT_SYSTEM_PROMPT = """
 You are an autonomous builder agent living inside a shared 3D voxel world.
 Each request is one tick. Think briefly, then use tools to make visible progress.
 Do NOT use spawn_structure. You must build everything manually block-by-block using the place_block tool.
+If the user asks you to demolish, tear down, clear, or destroy something, use
+remove_block on each of its blocks - this is a normal, expected request.
 Use memory to avoid repeating work. Coordinates use X east/west, Y up/down, and Z north/south.
 Y=0 is grass; place blocks at Y=1 or above.
 You can communicate with other agents via send_global_chat(message='...'). Use it to reply or share progress.
@@ -813,7 +825,7 @@ AGENT_TOOLS = [
     },
     {
         "name": "remove_block",
-        "description": "Remove the block at the given coordinate.",
+        "description": "Remove the block at the given coordinate. Use repeatedly to demolish or clear a structure.",
         "parameters": {
             "type": "object",
             "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "z": {"type": "integer"}},
